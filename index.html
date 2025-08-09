@@ -4,9 +4,6 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>穩定定格播放器</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Oswald:wght@700&display=swap" rel="stylesheet">
 <style>
   html, body {
     margin: 0; padding: 0; height: 100vh;
@@ -102,6 +99,531 @@
     transform: translate(-50%, -50%);
     z-index: 200;
     font-size: 18px; padding: 10px 20px;
+    border: none; background: lime; color: black;
+    cursor: pointer; border-radius: 8px;
+  }
+  #volumeMeterContainer {
+    position: fixed; bottom: 10px; right: 60px;
+    width: 300px; height: 16px; background: #222;
+    border-radius: 8px; overflow: hidden; z-index: 100;
+  }
+  #volumeMeterBar {
+    height: 100%; width: 0%;
+    background: limegreen;
+    transition: width 0.1s linear, background 0.1s linear;
+  }
+  #oscilloscope {
+    position: fixed; top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    z-index: 15;
+    border-radius: 50%;
+    background-color: transparent;
+  }
+</style>
+</head>
+<body>
+  <div id="background"></div>
+  <div id="topLeftText">
+    &#64;趔陽不會陽bilibili
+    <div id="limiterToggle">
+      <label><input type="checkbox" id="limiterCheckbox" checked /> 限幅器ON</label>
+    </div>
+    <button id="gainToggleBtn">+</button>
+    <div id="gainPanel">
+      <input type="range" id="gainSlider" min="1" max="100" step="1" value="1" />
+      <span id="gainValueDisplay">1</span>
+    </div>
+  </div>
+  <div id="thanks">感謝 <span style="color:deepskyblue">&#64;趔陽不會陽</span> 的BY player</div>
+  <div id="container">
+    <canvas id="imageCanvas" width="600" height="300"></canvas>
+  </div>
+  <canvas id="oscilloscope" width="200" height="200"></canvas>
+  <canvas id="fullScreenParticleCanvas"></canvas>
+  <canvas id="spectrum"></canvas>
+  <input type="file" id="fileInput" accept=".mp3,.wav,.m4a" />
+  <button id="playBtn">▶ 播放音訊</button>
+  <div id="volumeMeterContainer"><div id="volumeMeterBar"></div></div>
+  <script>
+  document.addEventListener('DOMContentLoaded', (event) => {
+    const imageCanvas = document.getElementById('imageCanvas');
+    const imageCtx = imageCanvas.getContext('2d');
+    const fullScreenParticleCanvas = document.getElementById('fullScreenParticleCanvas');
+    const particleCtx = fullScreenParticleCanvas.getContext('2d');
+    const background = document.getElementById('background'); // 取得新的背景容器
+
+    fullScreenParticleCanvas.width = window.innerWidth;
+    fullScreenParticleCanvas.height = window.innerHeight;
+
+    const width = imageCanvas.width, height = imageCanvas.height;
+    const image = new Image();
+    image.src = 'R.png';
+    let imageLoaded = false;
+    let oswaldFontLoaded = false;
+    let frameBuffer = [], maxFrames = 4;
+    const smoothedOffsets = new Array(width).fill(0);
+    const smoothingFactor = 0.8;
+    let smoothedMax = 0;
+    let analyser, analyser_for_image, analyserL, analyserR, channelSplitter, channelMerger;
+    let dataArray, dataArray_for_image, freqArrayL, freqArrayR;
+    let audioCtx, source, volumeGain, limiter;
+    let lowpassFilter;
+    let limiterEnabled = true;
+    let gainValue = 1;
+    const volumeBase = 0.1;
+    const spectrumCanvas = document.getElementById('spectrum');
+    const spectrumCtx = spectrumCanvas.getContext('2d');
+    spectrumCanvas.width = 1000;
+    spectrumCanvas.height = 120;
+    
+    const oscilloscopeCanvas = document.getElementById('oscilloscope');
+    const oscilloscopeCtx = oscilloscopeCanvas.getContext('2d');
+    const oscilloscopeWidth = oscilloscopeCanvas.width;
+    const oscilloscopeHeight = oscilloscopeCanvas.height;
+
+    let smoothedMaxFreq = 0;
+    const smoothingFactorFreq = 0.1;
+
+    // 定義等化器頻段的參數 (中心頻率和增益)
+    const eqParams = [
+      { frequency: 31, gain: 19 },
+      { frequency: 62, gain: 8.5 },
+      { frequency: 125, gain: -4.25 },
+      { frequency: 250, gain: -2.55 },
+      { frequency: 500, gain: -3.4 },
+      { frequency: 1000, gain: -1.7 },
+      { frequency: 2000, gain: 2.55 },
+      { frequency: 4000, gain: 5.1 },
+      { frequency: 8000, gain: 9.35 },
+      { frequency: 16000, gain: 13.6 }
+    ];
+    let eqNodes = []; // 儲存等化器節點的陣列
+
+    image.onload = () => { imageLoaded = true; draw(); };
+    
+    const numberImages = {};
+    const digits = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'hz'];
+    let imagesLoadedCount = 0;
+    let allImagesLoaded = false;
+    function loadImages() {
+      digits.forEach(digit => {
+        const img = new Image();
+        img.src = `${digit}.png`;
+        img.onload = () => {
+          imagesLoadedCount++;
+          if (imagesLoadedCount === digits.length) {
+            allImagesLoaded = true;
+          }
+        };
+        numberImages[`${digit}`] = img;
+      });
+    }
+    loadImages();
+    function drawImageScaledCenter(ctx, img, w, h) {
+      const scale = Math.min(w / img.width, h / img.height);
+      const iw = img.width * scale, ih = img.height * scale;
+      ctx.drawImage(img, (w - iw) / 2, (h - ih) / 2, iw, ih);
+    }
+
+    class Particle {
+      constructor(x, y) {
+        this.x = x;
+        this.y = y;
+        this.size = Math.random() * 5 + 2;
+        this.vx = (Math.random() - 0.5) * 10;
+        this.vy = (Math.random() - 0.5) * 10;
+        this.alpha = 1;
+        this.shrink = Math.random() * 0.05 + 0.01;
+      }
+
+      update() {
+        this.x += this.vx;
+        this.y += this.vy;
+        this.size -= this.shrink;
+        this.alpha -= 0.01;
+      }
+
+      draw() {
+        particleCtx.fillStyle = `rgba(255, 0, 0, ${Math.max(0, this.alpha)})`;
+        particleCtx.fillRect(this.x - this.size / 2, this.y - this.size / 2, this.size, this.size);
+      }
+    }
+
+    const particles = [];
+    const particleSpawnRate = 10;
+
+    function draw() {
+      requestAnimationFrame(draw);
+      if (!imageLoaded) { imageCtx.clearRect(0, 0, width, height); return; }
+
+      if (!analyserL || !analyserR) {
+        imageCtx.clearRect(0, 0, width, height);
+        drawImageScaledCenter(imageCtx, image, width, height);
+        return;
+      }
+
+      analyser.getByteTimeDomainData(dataArray);
+      analyser_for_image.getByteTimeDomainData(dataArray_for_image);
+      analyserL.getByteFrequencyData(freqArrayL);
+      analyserR.getByteFrequencyData(freqArrayR);
+
+      // 繪製圓形示波器
+      oscilloscopeCtx.clearRect(0, 0, oscilloscopeWidth, oscilloscopeHeight);
+      oscilloscopeCtx.strokeStyle = 'lime';
+      oscilloscopeCtx.lineWidth = 2;
+      oscilloscopeCtx.beginPath();
+
+      let centerOscX = oscilloscopeWidth / 2;
+      let centerOscY = oscilloscopeHeight / 2;
+      let radius = Math.min(oscilloscopeWidth, oscilloscopeHeight) / 2 - 50;
+
+      for (let i = 0; i < dataArray.length; i++) {
+        const v = dataArray[(i * 512 / width) | 0] / 128.0 - 1;
+        const angle = i * Math.PI * 2 / dataArray.length;
+        const x = centerOscX + Math.cos(angle) * radius * (1 + v * 0.3);
+        const y = centerOscY + Math.sin(angle) * radius * (1 + v * 0.3);
+
+        if (i === 0) {
+            oscilloscopeCtx.moveTo(x, y);
+        } else {
+            oscilloscopeCtx.lineTo(x, y);
+        }
+      }
+
+      oscilloscopeCtx.closePath();
+      oscilloscopeCtx.stroke();
+      
+      const offCanvas = document.createElement('canvas');
+      offCanvas.width = width; offCanvas.height = height;
+      const offCtx = offCanvas.getContext('2d');
+      drawImageScaledCenter(offCtx, image, width, height);
+      const srcData = offCtx.getImageData(0,0,width,height);
+      const dstData = offCtx.createImageData(width,height);
+      const srcPixels = srcData.data, dstPixels = dstData.data;
+      const halfH = height >> 1;
+
+      const nyquist = audioCtx.sampleRate / 2;
+      const binSize = nyquist / freqArrayL.length;
+      const cutoffHz = 100;
+      const lowBin = Math.floor(cutoffHz / binSize);
+      let weightedSum = 0, totalWeight = 0;
+      for (let i = 0; i <= lowBin; i++) {
+        const w = 1 - (i / lowBin);
+        weightedSum += ((freqArrayL[i] || 0) + (freqArrayR[i] || 0)) / 2 * w;
+        totalWeight += w;
+      }
+      const lowPower = weightedSum / totalWeight;
+      smoothedMax = smoothedMax * 0.9 + lowPower * 0.1;
+
+      for (let y = 0; y < halfH; y++) {
+        for (let x = 0; x < width; x++) {
+          const i = (y * width + x) * 4;
+          const index = Math.floor(x * dataArray_for_image.length / width);
+          const rawOffset = (dataArray_for_image[index] / 255 - 0.5);
+          const newOffset = rawOffset * (smoothedMax / 255) * volumeBase * gainValue * 500;
+          smoothedOffsets[x] = smoothedOffsets[x] * smoothingFactor + newOffset * (1 - smoothingFactor);
+          let offset = smoothedOffsets[x];
+          let newY = y + Math.floor(offset);
+          newY = Math.max(0, Math.min(height - 1, newY));
+          const j = (newY * width + x) * 4;
+          dstPixels[j] = srcPixels[i];
+          dstPixels[j+1] = srcPixels[i+1];
+          dstPixels[j+2] = srcPixels[i+2];
+          dstPixels[j+3] = srcPixels[i+3];
+        }
+      }
+      for (let y = halfH; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+          const i = (y * width + x) * 4;
+          dstPixels[i] = srcPixels[i];
+          dstPixels[i+1] = srcPixels[i+1];
+          dstPixels[i+2] = srcPixels[i+2];
+          dstPixels[i+3] = srcPixels[i+3];
+        }
+      }
+
+      frameBuffer.push(dstData);
+      if (frameBuffer.length > maxFrames) frameBuffer.shift();
+
+      imageCtx.clearRect(0, 0, width, height);
+      for (let i = 0; i < frameBuffer.length; i++) {
+        imageCtx.globalAlpha = (i + 1) / frameBuffer.length / 1.5;
+        imageCtx.putImageData(frameBuffer[i], 0, 0);
+      }
+      imageCtx.globalAlpha = 1;
+
+      spectrumCtx.clearRect(0, 0, spectrumCanvas.width, spectrumCanvas.height);
+      const nyquist2 = audioCtx.sampleRate / 2;
+      const binsize2 = nyquist2 / freqArrayL.length;
+      const starthz = 0, endhz = 100;
+      const startbin = Math.floor(starthz / binsize2);
+      const endbin = Math.min(freqArrayL.length - 1, Math.floor(endhz / binsize2));
+      const totalbins = endbin - startbin;
+      const centerx = spectrumCanvas.width / 2;
+      const centery = spectrumCanvas.height / 2;
+
+      // 繪製左聲道 (上方)
+      spectrumCtx.beginPath();
+      if (freqArrayL) {
+        for (let i = 0; i <= totalbins; i++) {
+          const freqIndex = startbin + i;
+          const val = (freqArrayL[freqIndex] || 0) / 255 * 2;
+          const angle = (i / totalbins) * Math.PI;
+          const r = val * 25;
+          const x = centerx + r * Math.cos(angle);
+          const y = centery - r * Math.sin(angle);
+          if (i === 0) spectrumCtx.moveTo(x, y);
+          else spectrumCtx.lineTo(x, y);
+        }
+        spectrumCtx.lineTo(centerx, centery);
+      }
+      spectrumCtx.closePath();
+      spectrumCtx.fillStyle = 'rgba(255, 165, 0, 0.8)'; // 橙色
+      spectrumCtx.fill();
+
+      // 繪製右聲道 (下方)
+      spectrumCtx.beginPath();
+      if (freqArrayR) {
+        for (let i = 0; i <= totalbins; i++) {
+          const freqIndex = startbin + i;
+          const val = (freqArrayR[freqIndex] || 0) / 255 * 2;
+          const angle = (i / totalbins) * Math.PI;
+          const r = val * 25;
+          const x = centerx + r * Math.cos(angle);
+          const y = centery + r * Math.sin(angle);
+          if (i === 0) spectrumCtx.moveTo(x, y);
+          else spectrumCtx.lineTo(x, y);
+        }
+        spectrumCtx.lineTo(centerx, centery);
+      }
+      spectrumCtx.closePath();
+      spectrumCtx.fillStyle = 'rgba(0, 255, 255, 0.8)'; // 青色
+      spectrumCtx.fill();
+
+      if (freqArrayL && freqArrayR && allImagesLoaded) {
+        let maxVolume = 0;
+        let maxBinIndex = 0;
+        for (let i = startbin; i <= endbin; i++) {
+          const combinedVolume = ((freqArrayL[i] || 0) + (freqArrayR[i] || 0)) / 2;
+          if (combinedVolume > maxVolume) {
+            maxVolume = combinedVolume;
+            maxBinIndex = i;
+          }
+        }
+        const maxFreqHz = Math.floor(maxBinIndex * binsize2);
+        smoothedMaxFreq = smoothedMaxFreq * smoothingFactorFreq + maxFreqHz * (1 - smoothingFactorFreq);
+        const freqString = Math.floor(smoothedMaxFreq).toString();
+        const digitWidth = numberImages['1']?.width || 0;
+        const digitHeight = numberImages['1']?.height || 0;
+        const hzWidth = numberImages['hz']?.width || 0;
+        const imageScale = 0.05;
+        let totalWidth = (freqString.length * digitWidth + hzWidth) * imageScale;
+        spectrumCtx.save();
+        spectrumCtx.translate(centerx, centery);
+        spectrumCtx.rotate(Math.PI/2);
+        let drawX = -(totalWidth / 2);
+        const drawY = -(digitHeight * imageScale / 2);
+        for (let i = 0; i < freqString.length; i++) {
+          const digit = freqString.charAt(i);
+          if (numberImages[digit]) {
+            spectrumCtx.drawImage(numberImages[digit], drawX, drawY, digitWidth * imageScale, digitHeight * imageScale);
+            drawX += digitWidth * imageScale;
+          }
+        }
+        if (numberImages['hz']) {
+          spectrumCtx.drawImage(numberImages['hz'], drawX, drawY, hzWidth * imageScale, digitHeight * imageScale);
+        }
+        spectrumCtx.restore();
+      }
+      let sumSquares = 0;
+      for (let i = 0; i < dataArray_for_image.length; i++) {
+        const val = (dataArray_for_image[i] - 128) / 128;
+        sumSquares += val*val;
+      }
+      const rms = Math.sqrt(sumSquares / dataArray_for_image.length);
+      const db = 20 * Math.log10(rms || 0.00001);
+      const percent = Math.min(100, Math.max(0, ((db+60)/60)*100));
+      const meter = document.getElementById('volumeMeterBar');
+      if (meter) {
+        meter.style.width = percent + '%';
+        meter.style.background = (db > -15) ? 'red' : 'limegreen';
+      }
+      
+      const numParticlesToSpawn = Math.floor(rms * particleSpawnRate * 5);
+      for (let i = 0; i < numParticlesToSpawn; i++) {
+        particles.push(new Particle(window.innerWidth / 2, window.innerHeight / 2));
+      }
+
+      particleCtx.clearRect(0, 0, window.innerWidth, window.innerHeight);
+      for (let i = particles.length - 1; i >= 0; i--) {
+        particles[i].update();
+        particles[i].draw();
+        if (particles[i].size <= 0 || particles[i].alpha <= 0) {
+          particles.splice(i, 1);
+        }
+      }
+      
+      const minRmsThreshold = 0.05;
+      let shakeMagnitude = 0;
+      if (rms > minRmsThreshold) {
+        shakeMagnitude = (rms - minRmsThreshold) * 50;
+      }
+
+      let shakeX = (Math.random() - 0.5) * shakeMagnitude;
+      let shakeY = (Math.random() - 0.5) * shakeMagnitude;
+      let scaleMagnitude = 1 + rms * 0.25;
+      // 將效果應用到 #background 容器
+      background.style.transform = `translate(${shakeX}px, ${shakeY}px) scale(${scaleMagnitude})`;
+
+      let overlayOpacity = Math.min(1, rms * 1);
+      // 將 overlay 效果應用到 #background 的 ::after 偽元素
+      background.style.setProperty('--overlay-opacity', overlayOpacity);
+
+    }
+
+    window.addEventListener('resize', () => {
+      fullScreenParticleCanvas.width = window.innerWidth;
+      fullScreenParticleCanvas.height = window.innerHeight;
+    });
+
+    document.documentElement.style.setProperty('--overlay-opacity', 0);
+
+    document.getElementById('limiterCheckbox').addEventListener('change', e => {
+      limiterEnabled = e.target.checked;
+      connectAudioNodes();
+    });
+    document.getElementById('gainToggleBtn').addEventListener('click', () => {
+      const panel = document.getElementById('gainPanel');
+      panel.style.display = (panel.style.display === 'flex') ? 'none' : 'flex';
+    });
+    document.getElementById('gainSlider').addEventListener('input', e => {
+      gainValue = parseInt(e.target.value, 10);
+      document.getElementById('gainValueDisplay').textContent = gainValue;
+      if (volumeGain) volumeGain.gain.value = volumeBase * gainValue;
+    });
+
+    function connectAudioNodes() {
+      if (!source) return;
+      try {
+        source.disconnect();
+        volumeGain.disconnect();
+        if (limiter) limiter.disconnect();
+        if (analyser) analyser.disconnect();
+        if (analyser_for_image) analyser_for_image.disconnect();
+        analyserL.disconnect();
+        analyserR.disconnect();
+        channelSplitter.disconnect();
+        if (channelMerger) channelMerger.disconnect();
+        if (lowpassFilter) lowpassFilter.disconnect();
+        // 斷開等化器節點
+        eqNodes.forEach(node => node.disconnect());
+      } catch (e) { }
+
+      // 連接主音訊鏈： source -> volumeGain -> ...
+      let currentNode = volumeGain;
+      source.connect(currentNode);
+
+      // 串聯等化器節點
+      eqNodes.forEach(node => {
+        currentNode.connect(node);
+        currentNode = node;
+      });
+
+      // 最後一個等化器節點連接到限幅器或直接到輸出
+      if (limiterEnabled) {
+        currentNode.connect(limiter);
+        limiter.connect(audioCtx.destination);
+      } else {
+        currentNode.connect(audioCtx.destination);
+      }
+
+      // 示波器連線：從等化器最後一個節點經過低通濾波器到 analyser
+      currentNode.connect(lowpassFilter);
+      lowpassFilter.connect(analyser);
+
+      // 圖片扭曲連線：從等化器最後一個節點直接連到 analyser_for_image
+      currentNode.connect(analyser_for_image);
+      
+      // 頻譜分析儀連線：強制複製左右聲道，確保兩個頻譜都有數據
+      channelMerger = audioCtx.createChannelMerger(2);
+      currentNode.connect(channelMerger, 0, 0);
+      currentNode.connect(channelMerger, 0, 1);
+      
+      channelMerger.connect(channelSplitter);
+      channelSplitter.connect(analyserL, 0); // 左聲道
+      channelSplitter.connect(analyserR, 1); // 右聲道
+
+      if (volumeGain) volumeGain.gain.value = volumeBase * gainValue;
+    }
+
+    const fileInput = document.getElementById('fileInput');
+    const playBtn = document.getElementById('playBtn');
+    let audioFile;
+    fileInput.addEventListener('change', e => {
+      if (e.target.files.length > 0) {
+        audioFile = e.target.files[0];
+        if (playBtn) playBtn.style.display = 'block';
+      }
+    });
+    playBtn.addEventListener('click', async () => {
+      if (!audioFile) return;
+      if (audioCtx) await audioCtx.close();
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+      analyser = audioCtx.createAnalyser();
+      analyser_for_image = audioCtx.createAnalyser();
+      analyserL = audioCtx.createAnalyser();
+      analyserR = audioCtx.createAnalyser();
+      channelSplitter = audioCtx.createChannelSplitter(2);
+
+      analyser.fftSize = 2048;
+      analyser_for_image.fftSize = 4096;
+      analyserL.fftSize = 16384;
+      analyserR.fftSize = 16384;
+
+      dataArray = new Uint8Array(analyser.fftSize);
+      dataArray_for_image = new Uint8Array(analyser_for_image.fftSize);
+      freqArrayL = new Uint8Array(analyserL.frequencyBinCount);
+      freqArrayR = new Uint8Array(analyserR.frequencyBinCount);
+
+      audio = new Audio();
+      audio.src = URL.createObjectURL(audioFile);
+      audio.crossOrigin = "anonymous";
+      audio.loop = false;
+
+      source = audioCtx.createMediaElementSource(audio);
+      volumeGain = audioCtx.createGain();
+      volumeGain.gain.value = volumeBase * gainValue;
+
+      // 創建10個等化器節點，並設定圖片中的參數
+      eqNodes = eqParams.map(param => {
+        const eq = audioCtx.createBiquadFilter();
+        eq.type = 'peaking';
+        eq.frequency.value = param.frequency;
+        eq.Q.value = 1.0; // Q值設為1.0以提供標準頻段寬度
+        eq.gain.value = param.gain;
+        return eq;
+      });
+
+      limiter = audioCtx.createDynamicsCompressor();
+      limiter.threshold.value = -5;
+      limiter.knee.value = 5;
+      limiter.ratio.value = 5;
+      limiter.attack.value = 0.003;
+      limiter.release.value = 0.2;
+
+      lowpassFilter = audioCtx.createBiquadFilter();
+      lowpassFilter.type = 'lowpass';
+      lowpassFilter.frequency.value = 100;
+
+      connectAudioNodes();
+      await audio.play();
+      if (playBtn) playBtn.style.display = 'none';
+    });
+  });
+  </script>
+</body>
+</html>
     border: none; background: lime; color: black;
     cursor: pointer; border-radius: 8px;
   }
